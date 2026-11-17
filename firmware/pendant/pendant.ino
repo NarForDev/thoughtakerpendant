@@ -22,14 +22,14 @@ const uint32_t RING_SAMPLES = 32768;  // 2.05 s; must be a power of two (index m
 const uint32_t BATCH_BLOCKS = 8;      // SD writes of 2 KB, whole blocks only
 const uint32_t FLUSH_MS = 2000;
 const uint64_t MIN_FREE_BYTES = 2ull * (HEADER_BYTES + CHUNK_BLOCKS * BLOCK_BYTES);
-const uint32_t FULL_RECHECK_MS = 5000;
+const uint32_t OPEN_RETRY_MS = 5000;  // while the card is full or a chunk failed to write
 const uint32_t PAIRING_WINDOW_MS = 120000;
+const uint32_t PAIRING_HOLD_MS = 3000;  // hold BOOT this long to forget the phone and pair a new one
 const uint32_t UNTRUSTED_LINK_MS = 30000;  // drop a link that never bonds so it cannot hold the only connection
 const uint16_t MIN_MTU = 247;
 const size_t MAX_FRAME = 512;  // ATT caps an attribute value at 512 bytes even when MTU - 3 is larger
 const size_t MAX_LIST_ENTRIES = (MAX_FRAME - 9) / 9;
 const uint64_t MIN_EPOCH_MS = 1577836800000ull;  // 2020-01-01; anything earlier is a phone bug
-const bool WAKE_WORD_BUILT_IN = false;           // flip when the wake-word detector lands
 
 // Energy VAD (per 505-sample block, after DC removal). First guesses: calibrate on the bench.
 const uint32_t VAD_MIN_ENERGY = 60 * 60;  // mean square; below this is silence whatever the floor says
@@ -55,7 +55,8 @@ Preferences prefs;
 I2SClass i2s;
 
 uint32_t storeId, bootId, nextSeq = 1;
-std::atomic<bool> muted{false}, wakeWordEnabled{false}, timeSynced{false}, storageFull{false}, sdError{false};
+bool cardReady;  // card mounted and /TK readable at boot; sdError on its own means only the last chunk write failed
+std::atomic<bool> muted{false}, timeSynced{false}, storageFull{false}, sdError{false};
 std::atomic<bool> headerDirty{false}, bleConnected{false}, linkTrusted{false};
 std::atomic<int64_t> epochOffsetMs{0};
 std::atomic<uint32_t> droppedSamples{0}, chunksWritten{0}, pendingChunks{0}, worstWriteUs{0}, ledOffAtMs{0};
@@ -79,11 +80,16 @@ TaskHandle_t bleTaskHandle;
 BLECharacteristic *tx;
 std::atomic<uint16_t> connHandle{0};
 std::atomic<int> notifyStatus{-1};
-std::atomic<int> bondCount{0};
+std::atomic<bool> pairingOpen{false};
+std::atomic<uint32_t> pairingOpenedMs{0};
 uint32_t connectedAtMs;
 
 uint64_t uptimeMs() { return (uint64_t)esp_timer_get_time() / 1000; }
-bool pairingWindowOpen() { return millis() < PAIRING_WINDOW_MS || bondCount == 0; }
+bool pairingWindowOpen() { return pairingOpen && millis() - pairingOpenedMs < PAIRING_WINDOW_MS; }
+void openPairingWindow() {
+  pairingOpenedMs = millis();
+  pairingOpen = true;
+}
 bool isRecording() { return !muted && !storageFull && !sdError; }
 
 void chunkPath(char *out, char cls, uint32_t seq) {
@@ -201,7 +207,7 @@ uint32_t noiseFloor = UINT32_MAX;
 uint8_t loudRun, stepIndex;
 
 void failRecording(const char *why) {
-  Serial.printf("SD error (%s): recording stopped, chunk %lu left for recovery at next boot\n", why, (unsigned long)rec.hdr.seq);
+  Serial.printf("SD error (%s): recording stopped, retrying; chunk %lu left for recovery at next boot\n", why, (unsigned long)rec.hdr.seq);
   sdError = true;
   rec.file.close();
   rec.open = false;
@@ -261,6 +267,7 @@ bool openChunk(int64_t firstSampleUs, bool continuous) {
     failRecording("open");
     return false;
   }
+  sdError = false;
   return true;
 }
 
@@ -357,7 +364,7 @@ void writerTask(void *) {
     }
 
     if (!rec.open) {
-      bool canTry = !sdError && (!storageFull || millis() - lastOpenTryMs >= FULL_RECHECK_MS);
+      bool canTry = cardReady && (!(storageFull || sdError) || millis() - lastOpenTryMs >= OPEN_RETRY_MS);
       if (canTry) lastOpenTryMs = millis();
       int64_t firstSampleUs = newestUs - (int64_t)(head - tail) * 1000000 / SAMPLE_RATE;
       if (!canTry || !openChunk(firstSampleUs, continuous)) {
@@ -473,17 +480,29 @@ void startStorage() {
   nextSeq = saved > maxSeq + 1 ? saved : maxSeq + 1;
   // The first free-space query can scan the whole FAT; do it now, before audio is waiting on the card.
   Serial.printf("SD: %llu MB free, %lu chunks pending, next seq %lu\n", freeBytes() / 1048576, (unsigned long)pending, (unsigned long)nextSeq);
+  cardReady = true;
 }
 
 // ---------------------------------------------------------------- BLE (2, 3)
 
+// The core's GAP handler answers a repeat pairing by deleting the old bond, which would let anyone spoofing the
+// owner's address erase it. That handler is private; explicit instantiation is the one legal way to take its address.
+template <int (*Fn)(ble_gap_event *, void *)> struct CoreGap {
+  friend int coreGapHandler(ble_gap_event *e, void *arg) { return Fn(e, arg); }
+};
+template struct CoreGap<&BLEServer::handleGATTServerEvent>;
+int coreGapHandler(ble_gap_event *e, void *arg);
+
+int gapHandler(ble_gap_event *e, void *arg) {
+  if (e->type == BLE_GAP_EVENT_REPEAT_PAIRING && !pairingWindowOpen()) return BLE_GAP_REPEAT_PAIRING_IGNORE;
+  return coreGapHandler(e, arg);
+}
+
 class ServerCallbacks : public BLEServerCallbacks {
   using BLEServerCallbacks::onConnect;
   using BLEServerCallbacks::onDisconnect;
-  void onConnect(BLEServer *, ble_gap_conn_desc *desc) override {
-    int n = 0;
-    ble_store_util_count(BLE_STORE_OBJ_TYPE_OUR_SEC, &n);
-    bondCount = n;
+  void onConnect(BLEServer *server, ble_gap_conn_desc *desc) override {
+    ble_gap_set_event_cb(desc->conn_handle, gapHandler, server);
     // Outside the pairing window a new phone may still encrypt, but cannot bond, and is dropped below.
     ble_hs_cfg.sm_bonding = pairingWindowOpen();
     connHandle = desc->conn_handle;
@@ -500,11 +519,10 @@ class ServerCallbacks : public BLEServerCallbacks {
 
 class SecurityCallbacks : public BLESecurityCallbacks {
   void onAuthenticationComplete(ble_gap_conn_desc *desc) override {
-    int n = 0;
-    ble_store_util_count(BLE_STORE_OBJ_TYPE_OUR_SEC, &n);
-    bondCount = n;
     if (desc->sec_state.encrypted && desc->sec_state.bonded) {
       linkTrusted = true;
+      pairingOpen = false;  // one phone per window, so only one bond is ever kept
+      if (!prefs.getBool("paired", false)) prefs.putBool("paired", true);
       return;
     }
     Serial.println("BLE: link not encrypted with a bond, disconnecting");
@@ -515,6 +533,7 @@ class SecurityCallbacks : public BLESecurityCallbacks {
 class RxCallbacks : public BLECharacteristicCallbacks {
   using BLECharacteristicCallbacks::onWrite;
   void onWrite(BLECharacteristic *c) override {
+    if (!linkTrusted) return;  // an encrypted but unbonded link is dropped asynchronously; its writes must not run
     Request r;
     size_t n = c->getLength();
     r.len = (uint16_t)(n > 0xFFFF ? 0xFFFF : n);
@@ -550,9 +569,6 @@ void startBle() {
   service->start();
   BLEDevice::getAdvertising()->addServiceUUID(SERVICE_UUID);
   BLEDevice::startAdvertising();
-  int n = 0;
-  ble_store_util_count(BLE_STORE_OBJ_TYPE_OUR_SEC, &n);
-  bondCount = n;
 }
 
 // Retries the same frame while the stack is out of buffers; never skips one (3.6).
@@ -583,9 +599,17 @@ void respond(uint8_t op, uint8_t reqId, uint8_t status, size_t payloadLen = 0) {
   sendFrame(frame, 4 + (status == ST_OK ? payloadLen : 0));
 }
 
+uint32_t listKeys[MAX_LIST_ENTRIES], listCount;  // the last LIST response, as class << 28 | seq
+
+// A failed open scans the whole of /TK, so try the class the last LIST reported before guessing.
 File openFinalized(uint32_t seq, char *path) {
-  for (char cls : {'B', 'S', 'Q'}) {
-    chunkPath(path, cls, seq);
+  char hint = 0;
+  for (uint32_t i = 0; i < listCount; i++)
+    if ((listKeys[i] & 0x0FFFFFFF) == seq) hint = "BSQ"[listKeys[i] >> 28];
+  const char order[] = {hint, 'B', 'S', 'Q'};
+  for (int i = 0; i < 4; i++) {
+    if (!order[i] || (i && order[i] == hint)) continue;
+    chunkPath(path, order[i], seq);
     File f = card.open(path);
     if (f) return f;
   }
@@ -596,13 +620,12 @@ void handleStatus(uint8_t id) {
   uint8_t *s = frame + 4;
   memset(s, 0, 32);
   put16(s, 1);
-  s[2] = (uint8_t)(isRecording() | muted << 1 | wakeWordEnabled << 2 | timeSynced << 3 | storageFull << 4 | sdError << 5
-                   | pairingWindowOpen() << 6);
+  s[2] = (uint8_t)(isRecording() | muted << 1 | timeSynced << 3 | storageFull << 4 | sdError << 5 | pairingWindowOpen() << 6);
   s[3] = 0xFF;  // battery unknown until the D0 ADC is wired
   put32(s + 4, storeId);
   put32(s + 8, bootId);
   put64(s + 12, uptimeMs());
-  if (!sdError) {
+  if (cardReady) {
     uint64_t total = card.totalBytes();
     put32(s + 20, (uint32_t)(freeBytes() / 1024));
     put32(s + 24, (uint32_t)(total / 1024));
@@ -613,42 +636,44 @@ void handleStatus(uint8_t id) {
 
 void handleList(uint8_t id, uint8_t maxEntries, uint16_t mtu) {
   if (!maxEntries) return respond(OP_LIST, id, ERR_BAD_VALUE);
-  if (sdError) return respond(OP_LIST, id, ERR_IO);
+  if (!cardReady) return respond(OP_LIST, id, ERR_IO);
   size_t frameMax = mtu - 3u < MAX_FRAME ? mtu - 3u : MAX_FRAME;
   uint32_t cap = (uint32_t)((frameMax - 9) / 9);
   if (maxEntries < cap) cap = maxEntries;
-  static uint32_t keys[MAX_LIST_ENTRIES], sizes[MAX_LIST_ENTRIES];
+  static uint32_t sizes[MAX_LIST_ENTRIES];
+  listCount = 0;  // listKeys is rebuilt in place below
   uint32_t total = 0, count = 0;
   bool ok = forEachChunk([&](char cls, uint32_t seq, uint32_t size) {
     if (cls == 'P') return;
     total++;
     uint32_t key = (uint32_t)(cls == 'B' ? 0 : cls == 'S' ? 1 : 2) << 28 | seq;  // seq < 2^28: sync order in one number
-    if (count == cap && key >= keys[count - 1]) return;
+    if (count == cap && key >= listKeys[count - 1]) return;
     uint32_t i = count < cap ? count++ : cap - 1;
-    for (; i > 0 && keys[i - 1] > key; i--) {
-      keys[i] = keys[i - 1];
+    for (; i > 0 && listKeys[i - 1] > key; i--) {
+      listKeys[i] = listKeys[i - 1];
       sizes[i] = sizes[i - 1];
     }
-    keys[i] = key;
+    listKeys[i] = key;
     sizes[i] = size;
   });
   if (!ok) return respond(OP_LIST, id, ERR_IO);
+  listCount = count;
   pendingChunks = total;
   uint8_t *p = frame + 4;
   put32(p, total);
   p[4] = (uint8_t)count;
   for (uint32_t i = 0; i < count; i++) {
     uint8_t *e = p + 5 + 9 * i;
-    put32(e, keys[i] & 0x0FFFFFFF);
+    put32(e, listKeys[i] & 0x0FFFFFFF);
     put32(e + 4, sizes[i]);
-    e[8] = listFlags("BSQ"[keys[i] >> 28]);
+    e[8] = listFlags("BSQ"[listKeys[i] >> 28]);
   }
   respond(OP_LIST, id, ST_OK, 5 + 9 * count);
 }
 
 void handlePull(uint8_t id, const uint8_t *p, uint16_t mtu) {
   uint32_t seq = get32(p), offset = get32(p + 4), length = get32(p + 8);
-  if (sdError) return respond(OP_PULL, id, ERR_IO);
+  if (!cardReady) return respond(OP_PULL, id, ERR_IO);
   char path[20];
   File f = openFinalized(seq, path);
   if (!f) return respond(OP_PULL, id, ERR_NOT_FOUND);
@@ -694,7 +719,7 @@ void handlePull(uint8_t id, const uint8_t *p, uint16_t mtu) {
 
 void handleAck(uint8_t id, const uint8_t *p) {
   uint32_t seq = get32(p), crc = get32(p + 4);
-  if (sdError) return respond(OP_ACK, id, ERR_IO);
+  if (!cardReady) return respond(OP_ACK, id, ERR_IO);
   char path[20];
   File f = openFinalized(seq, path);
   if (!f) return respond(OP_ACK, id, ST_OK);  // already gone: a retried ACK must not fail
@@ -737,12 +762,7 @@ void handleRequest(const Request &r) {
       prefs.putBool("muted", p[0]);
       Serial.println(p[0] ? "muted" : "unmuted");
       return respond(op, id, ST_OK);
-    case OP_SET_WAKE_WORD:
-      if (!WAKE_WORD_BUILT_IN) return respond(op, id, ERR_UNSUPPORTED);
-      if (p[0] > 1) return respond(op, id, ERR_BAD_VALUE);
-      wakeWordEnabled = p[0];
-      prefs.putBool("wake", p[0]);
-      return respond(op, id, ST_OK);
+    case OP_SET_WAKE_WORD: return respond(op, id, ERR_UNSUPPORTED);  // no detector yet
   }
 }
 
@@ -764,7 +784,8 @@ void setup() {
   bootId = prefs.getUInt("boot_id", 0) + 1;
   prefs.putUInt("boot_id", bootId);
   muted = prefs.getBool("muted", false);
-  wakeWordEnabled = WAKE_WORD_BUILT_IN && prefs.getBool("wake", false);
+  if (!prefs.getBool("paired", false)) openPairingWindow();  // out of the box: no button press needed
+  pinMode(BOOT_PIN, INPUT_PULLUP);
   requests = xQueueCreate(2, sizeof(Request));
   events = xQueueCreate(8, sizeof(Event));
   bookmarks = xQueueCreate(4, sizeof(uint64_t));
@@ -785,10 +806,19 @@ void loop() {
   while (Serial.available()) {
     if (Serial.read() == 'b') bookmark();
   }
-  if (ledOffAtMs && (int32_t)(millis() - ledOffAtMs) >= 0) {
-    digitalWrite(LED_BUILTIN, HIGH);
-    ledOffAtMs = 0;
+  // Only a deliberate press on the pendant lets a new phone bond, and it forgets the old one: one bond at a time.
+  static uint32_t heldSinceMs = 0;
+  if (digitalRead(BOOT_PIN) == HIGH) heldSinceMs = 0;
+  else if (!heldSinceMs) heldSinceMs = millis() | 1;
+  else if (heldSinceMs != UINT32_MAX && millis() - heldSinceMs >= PAIRING_HOLD_MS) {
+    heldSinceMs = UINT32_MAX;  // once per press
+    if (bleConnected) ble_gap_terminate(connHandle, BLE_ERR_REM_USER_CONN_TERM);
+    ble_store_clear();
+    openPairingWindow();
+    Serial.println("BLE: bonds cleared, pairing window open");
   }
+  if (ledOffAtMs && (int32_t)(millis() - ledOffAtMs) >= 0) ledOffAtMs = 0;
+  digitalWrite(LED_BUILTIN, pairingWindowOpen() || ledOffAtMs ? LOW : HIGH);  // active LOW: on while pairing
   if (bleConnected && !linkTrusted && millis() - connectedAtMs > UNTRUSTED_LINK_MS) {
     Serial.println("BLE: link never bonded, disconnecting");
     ble_gap_terminate(connHandle, BLE_ERR_REM_USER_CONN_TERM);

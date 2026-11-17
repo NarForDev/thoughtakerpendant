@@ -40,7 +40,10 @@ The firmware removes DC (the INMP441 offset drifts after power-up) before VAD an
 | `seq` | u32 counter, unique per `store_id`, starts at 1, +1 per chunk, never reused; max `0x0FFFFFFF` (7 hex digits, about 510 years) |
 
 The class prefix lets the device sort the sync order from directory names alone, without opening files.
-At most one `.PRT` file exists while the device runs.
+At most one `.PRT` file exists while the device runs, plus one left behind by each SD write error (see 1.6 rule 6).
+
+**Not encrypted:** chunks are stored as plain WAV files. Anyone holding the pendant can remove the card and play
+every chunk that has not been synced and acked. Encryption at rest is deferred.
 
 `seq` and `boot_id` are kept in NVS. At boot, `next_seq = max(NVS next_seq, highest seq on card + 1)`.
 NVS `next_seq` is written when each chunk opens. `boot_id` is a u32 that goes up by 1 on every boot.
@@ -126,6 +129,9 @@ Writer rules for the firmware:
    The rename rewrites one 8.3 directory entry, which makes it the commit point.
 5. If storage is full (free space under 2 chunks), finalize, stop recording, and set `storage_full`.
    The device never deletes chunks that have not been acked.
+6. If an open, write, or rename fails, close the chunk (it stays a `.PRT` until recovery at the next boot), set `sd_error`,
+   and try a new chunk every 5 s; `sd_error` clears when one opens. LIST, PULL and ACK keep serving finalized chunks:
+   they return `ERR_IO` only when no card was mounted at boot or that operation's own SD access fails.
 
 Recovery, at boot before recording starts, for each `*.PRT`:
 
@@ -166,11 +172,15 @@ A power cut can still corrupt the FAT itself. That is out of scope.
 - LE Secure Connections only (no legacy pairing), bonding on, IO capability NoInputNoOutput, so the method is **Just Works**.
   Firmware: `BLESecurity::setCapability(ESP_IO_CAP_NONE)`, `setAuthenticationMode(true /*bond*/, false /*mitm*/, true /*sc*/)`.
 - The phone calls `createBond()` before its first GATT operation. Any RX write on an unencrypted link fails with ATT error `0x05` (Insufficient Authentication) when the phone has no bond with the device, or `0x0F` (Insufficient Encryption) when it has one (NimBLE's rule).
-- **Pairing window:** the device accepts a *new* bond only within 120 s of power-on, or while it has no bonds.
-  Outside the window, if a link is encrypted but its peer is not an existing bond, the device disconnects it.
-  To pair a new phone, the user power-cycles the pendant. Up to 3 bonds are kept, and the oldest is replaced.
+- **Pairing window:** the device accepts a *new* bond only while its pairing window is open, which takes action on the pendant:
+  - for 120 s after power-on, but only until a phone has bonded for the first time (an NVS flag, so a reboot never reopens it);
+  - for 120 s after the user holds the BOOT button for 3 s. This also deletes every bond and drops the current link,
+    so the old phone must re-pair (on Android, forget the pendant first).
+  The status LED stays on while the window is open. The window closes as soon as a phone bonds, so one bond is kept.
+- Outside the window: a link that encrypts without an existing bond is disconnected, and its RX writes are ignored until then.
+  A peer that tries to pair again with a bonded address is refused (the bond is kept).
 - The phone shows every device advertising the service and pairs only the one the user picks.
-  It saves that device only if GET_STATUS then reports `pairing_window_open`; otherwise it tells the user to power-cycle the pendant.
+  It saves that device only if GET_STATUS then reports `pairing_window_open`; otherwise it tells the user to hold the pendant's BOOT button for 3 s.
 - **MITM limitation:** Just Works does not authenticate the peer. An attacker who is in radio range *during pairing* can sit in the middle or pair first.
   Once a bond exists, the link is AES-CCM encrypted and integrity-protected. The pairing window keeps the exposure short.
   Real MITM protection needs an out-of-band secret (for example a QR code on the device, used for LE OOB) and is deferred.
@@ -237,6 +247,8 @@ Status payload (32 B):
 | 28 | u32 | pending_chunks (finalized `.WAV` count) |
 
 `recording` = not muted, and not `storage_full`, and not `sd_error`.
+`sd_error` = no usable card at boot, or the last chunk open or write failed (the device retries every 5 s, see 1.6 rule 6).
+This firmware has no wake-word engine: SET_WAKE_WORD always returns ERR_UNSUPPORTED and `wake_word_enabled` is 0.
 
 LIST Entry (9 B): `seq u32`, `size u32` (valid file length), `flags u8` (bit0 `has_speech`, bit1 `bookmarked`, taken from the class prefix).
 
@@ -264,7 +276,7 @@ LIST Entry (9 B): `seq u32`, `size u32` (valid file length), `flags u8` (bit0 `h
   and after reconnecting it sends `PULL seq offset=contiguous_bytes_received`.
   If a DATA offset is not the next expected one, the phone treats the window as failed and pulls again from its contiguous point.
 - A chunk is deleted only by an ACK with a matching crc, so a pull can always be resumed or restarted.
-  `ERR_NOT_FOUND` on PULL means the chunk was already acked (another bonded phone, or an ACK whose RESP was lost): discard the partial file.
+  `ERR_NOT_FOUND` on PULL means the chunk was already acked (for example, an ACK whose RESP was lost): discard the partial file.
 - Device notify backpressure: if `notify()` fails (reported synchronously, in the calling task, through `BLECharacteristicCallbacks::onStatus` with `ERROR_GATT`, for example when the stack is out of buffers),
   the device waits a few ms and resends **the same** frame. It never skips a DATA frame.
 
