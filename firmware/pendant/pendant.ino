@@ -25,7 +25,10 @@ const uint64_t MIN_FREE_BYTES = 2ull * (HEADER_BYTES + CHUNK_BLOCKS * BLOCK_BYTE
 const uint32_t OPEN_RETRY_MS = 5000;  // while the card is full or a chunk failed to write
 const uint32_t PAIRING_WINDOW_MS = 120000;
 const uint32_t PAIRING_HOLD_MS = 3000;  // hold BOOT this long to forget the phone and pair a new one
-const uint32_t UNTRUSTED_LINK_MS = 30000;  // drop a link that never bonds so it cannot hold the only connection
+// Drop a link that has not encrypted with a bond so an idle peer cannot hold the only connection.
+// A bonded phone encrypts on its first RX write, well within this.
+const uint32_t UNTRUSTED_LINK_MS = 5000;
+const uint32_t PAIRING_LINK_MS = 30000;  // in the pairing window the user may still be accepting the phone's pairing prompt
 const uint16_t MIN_MTU = 247;
 const size_t MAX_FRAME = 512;  // ATT caps an attribute value at 512 bytes even when MTU - 3 is larger
 const size_t MAX_LIST_ENTRIES = (MAX_FRAME - 9) / 9;
@@ -819,7 +822,7 @@ void loop() {
   }
   if (ledOffAtMs && (int32_t)(millis() - ledOffAtMs) >= 0) ledOffAtMs = 0;
   digitalWrite(LED_BUILTIN, pairingWindowOpen() || ledOffAtMs ? LOW : HIGH);  // active LOW: on while pairing
-  if (bleConnected && !linkTrusted && millis() - connectedAtMs > UNTRUSTED_LINK_MS) {
+  if (bleConnected && !linkTrusted && millis() - connectedAtMs > (pairingWindowOpen() ? PAIRING_LINK_MS : UNTRUSTED_LINK_MS)) {
     Serial.println("BLE: link never bonded, disconnecting");
     ble_gap_terminate(connHandle, BLE_ERR_REM_USER_CONN_TERM);
     connectedAtMs = millis();  // terminate once, not every loop

@@ -179,8 +179,11 @@ A power cut can still corrupt the FAT itself. That is out of scope.
   The status LED stays on while the window is open. The window closes as soon as a phone bonds, so one bond is kept.
 - Outside the window: a link that encrypts without an existing bond is disconnected, and its RX writes are ignored until then.
   A peer that tries to pair again with a bonded address is refused (the bond is kept).
+- A link that has not encrypted with a bond is dropped 5 s after connecting (30 s while the pairing window is open, so the user can accept the pairing prompt).
+  The phone must therefore make its first RX write, which encrypts a bonded link, within 5 s of connecting.
 - The phone shows every device advertising the service and pairs only the one the user picks.
-  It saves that device only if GET_STATUS then reports `pairing_window_open`; otherwise it tells the user to hold the pendant's BOOT button for 3 s.
+  It saves that device if it just bonded with it (a new bond is only possible inside the window, and bonding closes it),
+  or if it already had a bond and GET_STATUS reports `pairing_window_open`; otherwise it tells the user to hold the pendant's BOOT button for 3 s.
 - **MITM limitation:** Just Works does not authenticate the peer. An attacker who is in radio range *during pairing* can sit in the middle or pair first.
   Once a bond exists, the link is AES-CCM encrypted and integrity-protected. The pairing window keeps the exposure short.
   Real MITM protection needs an out-of-band secret (for example a QR code on the device, used for LE OOB) and is deferred.
