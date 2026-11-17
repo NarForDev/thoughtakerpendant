@@ -45,7 +45,9 @@ At most one `.PRT` file exists while the device runs.
 `seq` and `boot_id` are kept in NVS. At boot, `next_seq = max(NVS next_seq, highest seq on card + 1)`.
 NVS `next_seq` is written when each chunk opens. `boot_id` is a u32 that goes up by 1 on every boot.
 `store_id` is a random u32 created the first time NVS is empty, which means it changes after a full flash erase.
-The phone identifies a chunk by **(`store_id`, `seq`)**.
+The phone identifies a chunk by **(`store_id`, `seq`)**, taking `store_id` from the chunk's own header (offset 64).
+After a full flash erase, chunks still on the card carry the old `store_id`, which differs from the one in GET_STATUS.
+The device lists, pulls and ACKs them by `seq` alone like any other chunk; the phone checks only `seq` against the LIST entry.
 
 ### 1.4 File layout: a fixed 512-byte header, then audio
 
@@ -167,6 +169,8 @@ A power cut can still corrupt the FAT itself. That is out of scope.
 - **Pairing window:** the device accepts a *new* bond only within 120 s of power-on, or while it has no bonds.
   Outside the window, if a link is encrypted but its peer is not an existing bond, the device disconnects it.
   To pair a new phone, the user power-cycles the pendant. Up to 3 bonds are kept, and the oldest is replaced.
+- The phone shows every device advertising the service and pairs only the one the user picks.
+  It saves that device only if GET_STATUS then reports `pairing_window_open`; otherwise it tells the user to power-cycle the pendant.
 - **MITM limitation:** Just Works does not authenticate the peer. An attacker who is in radio range *during pairing* can sit in the middle or pair first.
   Once a bond exists, the link is AES-CCM encrypted and integrity-protected. The pairing window keeps the exposure short.
   Real MITM protection needs an out-of-band secret (for example a QR code on the device, used for LE OOB) and is deferred.
