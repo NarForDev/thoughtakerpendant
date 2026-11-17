@@ -30,6 +30,7 @@ const uint32_t PAIRING_HOLD_MS = 3000;  // hold BOOT this long to forget the pho
 const uint32_t UNTRUSTED_LINK_MS = 5000;
 const uint32_t PAIRING_LINK_MS = 30000;  // in the pairing window the user may still be accepting the phone's pairing prompt
 const uint16_t MIN_MTU = 247;
+const int NOTIFY_MIN_FREE_MBUFS = 8;  // a 507 B frame takes ~2 of the 320 B blocks; margin for the BLE host's own use
 const size_t MAX_FRAME = 512;  // ATT caps an attribute value at 512 bytes even when MTU - 3 is larger
 const size_t MAX_LIST_ENTRIES = (MAX_FRAME - 9) / 9;
 const uint64_t MIN_EPOCH_MS = 1577836800000ull;  // 2020-01-01; anything earlier is a phone bug
@@ -576,6 +577,8 @@ void startBle() {
 // Retries the same frame while the stack is out of buffers; never skips one (3.6).
 bool sendFrame(const uint8_t *data, size_t len) {
   for (int tries = 0; tries < 500 && bleConnected; tries++) {
+    // An empty pool makes the core hand NimBLE a NULL mbuf, which ends in an assert (no connection) in the core's read handler.
+    if (os_msys_num_free() < NOTIFY_MIN_FREE_MBUFS) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }
     notifyStatus = -1;
     tx->setValue(data, len);
     tx->notify();
