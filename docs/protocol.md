@@ -169,7 +169,7 @@ A power cut can still corrupt the FAT itself. That is out of scope.
 
 ### 2.3 Pairing and bonding
 
-- LE Secure Connections only (no legacy pairing), bonding on, IO capability NoInputNoOutput, so the method is **Just Works**.
+- LE Secure Connections requested (legacy pairing is not refused: SC-only mode demands authenticated pairing, which Just Works can't provide), bonding on, IO capability NoInputNoOutput, so the method is **Just Works**.
   Firmware: `BLESecurity::setCapability(ESP_IO_CAP_NONE)`, `setAuthenticationMode(true /*bond*/, false /*mitm*/, true /*sc*/)`.
 - The phone calls `createBond()` before its first GATT operation. Any RX write on an unencrypted link fails with ATT error `0x05` (Insufficient Authentication) when the phone has no bond with the device, or `0x0F` (Insufficient Encryption) when it has one (NimBLE's rule).
 - **Pairing window:** the device accepts a *new* bond only while its pairing window is open, which takes action on the pendant:

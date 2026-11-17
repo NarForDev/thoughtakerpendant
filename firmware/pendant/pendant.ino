@@ -559,7 +559,6 @@ void startBle() {
   new BLESecurity();  // its constructor sets key distribution (encryption + identity keys)
   BLESecurity::setCapability(ESP_IO_CAP_NONE);
   BLESecurity::setAuthenticationMode(true, false, true);
-  ble_hs_cfg.sm_sc_only = 1;  // LE Secure Connections only, no legacy pairing
   BLEDevice::setSecurityCallbacks(new SecurityCallbacks());
   BLEServer *server = BLEDevice::createServer();
   server->setCallbacks(new ServerCallbacks());
