@@ -1,6 +1,7 @@
 // Bring-up step 5: can the C6 run streaming wake-word models on live mic audio, and how fast?
 // Uses published microWakeWord models (okay_nabu, vad) before we train "Perthro".
 #include <ESP_I2S.h>
+#include <mbedtls/base64.h>
 #include <tensorflow/lite/micro/micro_allocator.h>
 #include <tensorflow/lite/micro/micro_interpreter.h>
 #include <tensorflow/lite/micro/micro_mutable_op_resolver.h>
@@ -13,6 +14,8 @@ const uint32_t SAMPLE_RATE = 16000;
 const size_t STEP_SAMPLES = 160;  // 10 ms feature step, as the models were trained
 const int FEATURE_COUNT = 40;
 const uint32_t REPORT_MS = 5000;
+const size_t CLIP_SAMPLES = SAMPLE_RATE * 5 / 2;  // 2.5 s of audio sent with each detection
+static_assert(CLIP_SAMPLES % STEP_SAMPLES == 0, "the clip ring is filled one step at a time");
 
 struct StreamingModel {
   const char *name;
@@ -33,6 +36,26 @@ StreamingModel models[] = {
 I2SClass i2s;
 FrontendState frontend;
 tflite::MicroMutableOpResolver<20> resolver;
+int16_t clip[CLIP_SAMPLES];  // ring of the latest audio; clipPos is the oldest sample
+size_t clipPos;
+
+void printBase64(const uint8_t *data, size_t len) {
+  uint8_t out[1028];
+  for (size_t i = 0; i < len; i += 768) {  // 768 B is a multiple of 3, so the chunks join into one valid string
+    size_t written;
+    mbedtls_base64_encode(out, sizeof out, &written, data + i, min(len - i, (size_t)768));
+    Serial.write(out, written);
+  }
+}
+
+// One line: "CLIP <model> <rate> <older part> <newer part>", 16-bit PCM in base64, read by the live page
+void sendClip(const char *name) {
+  Serial.printf("CLIP %s %u ", name, SAMPLE_RATE);
+  printBase64((const uint8_t *)(clip + clipPos), (CLIP_SAMPLES - clipPos) * sizeof *clip);
+  Serial.print(' ');
+  printBase64((const uint8_t *)clip, clipPos * sizeof *clip);
+  Serial.println();
+}
 
 void registerOps() {  // the op set microWakeWord's streaming models use
   resolver.AddCallOnce(); resolver.AddVarHandle(); resolver.AddReadVariable(); resolver.AddAssignVariable();
@@ -91,7 +114,10 @@ void feed(StreamingModel &m, const int8_t *features) {
   for (uint8_t p : m.recent) sum += p;
   if (sum / sizeof m.recent > m.cutoff) {
     m.hits++;
-    if (m.flatbuffer == okay_nabu_tflite) Serial.println("DETECTED okay_nabu");
+    if (m.flatbuffer == okay_nabu_tflite) {
+      Serial.println("DETECTED okay_nabu");
+      sendClip(m.name);
+    }
     memset(m.recent, 0, sizeof m.recent);
   }
 }
@@ -119,6 +145,8 @@ void loop() {
   static int8_t features[FEATURE_COUNT];
   static uint32_t lastReportMs, frontendUs;
   i2s.readBytes((char *)samples, sizeof samples);
+  memcpy(clip + clipPos, samples, sizeof samples);
+  clipPos = (clipPos + STEP_SAMPLES) % CLIP_SAMPLES;
   uint32_t t = micros();
   size_t used;
   FrontendOutput out = FrontendProcessSamples(&frontend, samples, STEP_SAMPLES, &used);
