@@ -163,7 +163,7 @@ A power cut can still corrupt the FAT itself. That is out of scope.
 
 - LE Secure Connections only (no legacy pairing), bonding on, IO capability NoInputNoOutput, so the method is **Just Works**.
   Firmware: `BLESecurity::setCapability(ESP_IO_CAP_NONE)`, `setAuthenticationMode(true /*bond*/, false /*mitm*/, true /*sc*/)`.
-- The phone calls `createBond()` before its first GATT operation. Any RX write on an unencrypted link fails with ATT error `0x0F` (Insufficient Encryption).
+- The phone calls `createBond()` before its first GATT operation. Any RX write on an unencrypted link fails with ATT error `0x05` (Insufficient Authentication) when the phone has no bond with the device, or `0x0F` (Insufficient Encryption) when it has one (NimBLE's rule).
 - **Pairing window:** the device accepts a *new* bond only within 120 s of power-on, or while it has no bonds.
   Outside the window, if a link is encrypted but its peer is not an existing bond, the device disconnects it.
   To pair a new phone, the user power-cycles the pendant. Up to 3 bonds are kept, and the oldest is replaced.
@@ -175,7 +175,7 @@ A power cut can still corrupt the FAT itself. That is out of scope.
 
 ### 3.1 Framing
 
-Every RX write is one request. Every TX notification is one frame.
+Every RX write is one request. Every TX notification is one frame of at most `min(MTU - 3, 512)` bytes: ATT caps an attribute value at 512 bytes even when the MTU allows more.
 
 RX request: `[op u8][req_id u8][payload]`. `req_id` is chosen by the phone and echoed in the response.
 
@@ -184,7 +184,7 @@ TX frames:
 | Kind (byte 0) | Layout |
 |---|---|
 | `0x01` RESP | `[0x01][op u8][req_id u8][status u8][payload]` |
-| `0x02` DATA | `[0x02][offset u32][bytes]`: file bytes for the active PULL; at most `MTU - 3 - 5` bytes (509 at MTU 517) |
+| `0x02` DATA | `[0x02][offset u32][bytes]`: file bytes for the active PULL; at most `min(MTU - 3, 512) - 5` bytes (507 at MTU 517) |
 | `0x03` EVENT | `[0x03][event u8][payload]` |
 
 Sequencing: **one request at a time.** After its write is acknowledged, the phone waits for the RESP with the matching `req_id`
@@ -212,7 +212,7 @@ Every request gets exactly one RESP. A payload follows only when `status = 0`.
 |---|---|---|---|---|
 | 0x01 | GET_STATUS | none | Status, 32 B (below) | |
 | 0x02 | SET_TIME | `epoch_ms u64` | none | Sets `epoch_offset = epoch_ms - uptime_ms` for this boot; not kept across reboots |
-| 0x03 | LIST | `max_entries u8` (>=1) | `total_pending u32`, `count u8`, then `count` x Entry (9 B) | Order: class B, then S, then Q; within a class, ascending seq. `count = min(max_entries, (MTU-3-9)/9, total_pending)`. Excludes the chunk being recorded. |
+| 0x03 | LIST | `max_entries u8` (>=1) | `total_pending u32`, `count u8`, then `count` x Entry (9 B) | Order: class B, then S, then Q; within a class, ascending seq. `count = min(max_entries, (min(MTU-3, 512)-9)/9, total_pending)` (55 at MTU 517). Excludes the chunk being recorded. |
 | 0x04 | PULL | `seq u32`, `offset u32`, `length u32` | none | DATA frames cover `[offset, offset+length)` in order, and **the RESP comes after the last DATA frame**. 1 <= length <= 65536, and offset+length <= the valid file length. |
 | 0x05 | ACK | `seq u32`, `crc32 u32` | none | The device deletes the chunk only if `crc32` equals the stored header crc. ACK of a seq that does not exist returns **OK** (idempotent: a retry after a lost RESP must not fail). |
 | 0x06 | SET_MUTE | `muted u8` (0/1) | none | Muting finalizes the current chunk and stops the mic. Kept in NVS across reboots. |
@@ -261,7 +261,7 @@ LIST Entry (9 B): `seq u32`, `size u32` (valid file length), `flags u8` (bit0 `h
   If a DATA offset is not the next expected one, the phone treats the window as failed and pulls again from its contiguous point.
 - A chunk is deleted only by an ACK with a matching crc, so a pull can always be resumed or restarted.
   `ERR_NOT_FOUND` on PULL means the chunk was already acked (another bonded phone, or an ACK whose RESP was lost): discard the partial file.
-- Device notify backpressure: if `notify()` fails (reported through `BLECharacteristicCallbacks::onStatus`, for example when the stack is out of buffers),
+- Device notify backpressure: if `notify()` fails (reported synchronously, in the calling task, through `BLECharacteristicCallbacks::onStatus` with `ERROR_GATT`, for example when the stack is out of buffers),
   the device waits a few ms and resends **the same** frame. It never skips a DATA frame.
 
 ## 4. Throughput
@@ -272,7 +272,7 @@ LIST Entry (9 B): `seq u32`, `size u32` (valid file length), `flags u8` (bit0 `h
 | Per hour | 29.2 MB |
 | Per 16-h waking day | 468 MB |
 | Per 24 h | 702 MB; a 32 GB card holds about 45 days (the FAT32 limit of 65,536 entries per directory also lands near 45 days) |
-| DATA payload per notification | 509 B at MTU 517, so 958 notifications per full chunk |
+| DATA payload per notification | 507 B at MTU 517, so 961 notifications per full chunk |
 | 2M PHY ceiling | Each encrypted 251-B LL PDU takes 266 B on air = 1064 us, plus 2 x 150 us IFS and a 44 us empty ack, about 1.41 ms per PDU, so at most about 178 kB/s |
 | Realistic ESP32-C6 to Android | 50-100 kB/s with 2M PHY, DLE, and MTU 517 (the phone's connection-event length is the limit); plan for **60 kB/s**; worst case about 25 kB/s (1M PHY, no DLE) |
 
