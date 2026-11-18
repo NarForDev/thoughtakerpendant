@@ -28,6 +28,7 @@ augmenter = Augmentation(
 # (folder, split, repeats, slide_frames): testing runs the streaming model, so it needs no shifted copies
 for folder, split, repeat, slide in [("training", "train", 2, 10), ("validation", "validation", 1, 10), ("testing", "test", 1, 1)]:
     spectrograms = SpectrogramGeneration(clips=clips, augmenter=augmenter, slide_frames=slide, step_ms=10)
+    os.makedirs(os.path.join(args.out_dir, folder), exist_ok=True)  # RaggedMmap only creates the last folder
     RaggedMmap.from_generator(out_dir=os.path.join(args.out_dir, folder, "wakeword_mmap"),
                               sample_generator=spectrograms.spectrogram_generator(split=split, repeat=repeat),
                               batch_size=100, verbose=True)

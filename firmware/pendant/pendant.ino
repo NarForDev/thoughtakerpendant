@@ -1,6 +1,7 @@
 // Thoughtaker pendant: records 16 kHz audio to microSD as 60 s IMA ADPCM chunks and serves them
 // to the phone over BLE. docs/protocol.md is the contract; section numbers below refer to it.
-// Tasks: mic (I2S -> RAM ring), writer (ring -> DC removal, VAD, ADPCM -> SD), ble (requests and events).
+// Tasks: mic (I2S -> RAM ring), writer (ring -> DC removal, VAD, ADPCM -> SD), ble (requests and events),
+// wake (wake-word models, when wake_models.h was generated; see training/wakeword/README.md).
 #include <ESP_I2S.h>
 #include <SD.h>
 #include <vfs_api.h>
@@ -17,6 +18,18 @@
 #include "host/ble_hs.h"
 #include "host/ble_store.h"
 #include "chunk.h"
+#if __has_include("wake_models.h")
+#include <tensorflow/lite/micro/micro_allocator.h>
+#include <tensorflow/lite/micro/micro_interpreter.h>
+#include <tensorflow/lite/micro/micro_mutable_op_resolver.h>
+#include <tensorflow/lite/micro/micro_resource_variable.h>
+#include "src/microfrontend/src/frontend.h"
+#include "src/microfrontend/src/frontend_util.h"
+#include "wake_models.h"
+#define HAS_WAKE_WORD 1
+#else
+#define HAS_WAKE_WORD 0
+#endif
 
 const uint32_t RING_SAMPLES = 32768;  // 2.05 s; must be a power of two (index masking)
 const uint32_t BATCH_BLOCKS = 8;      // SD writes of 2 KB, whole blocks only
@@ -34,6 +47,28 @@ const int NOTIFY_MIN_FREE_MBUFS = 8;  // a 507 B frame takes ~2 of the 320 B blo
 const size_t MAX_FRAME = 512;  // ATT caps an attribute value at 512 bytes even when MTU - 3 is larger
 const size_t MAX_LIST_ENTRIES = (MAX_FRAME - 9) / 9;
 const uint64_t MIN_EPOCH_MS = 1577836800000ull;  // 2020-01-01; anything earlier is a phone bug
+
+// Wake word: "Perthro" starts and stops recording, "Perthro mark" bookmarks, "Perthro forget" twice deletes the last 5 min.
+const uint32_t PREROLL_BLOCKS = 951;       // 30 s; while waiting, the previous and the current 30 s are kept as pre-roll
+const uint32_t TOGGLE_DELAY_MS = 1500;     // "Perthro mark" and "Perthro forget" begin with "Perthro": wait to see which it was
+const uint32_t FORGET_CONFIRM_MS = 10000;  // the second "Perthro forget" must come within this
+const uint64_t FORGET_MS = 5 * 60 * 1000;
+const uint32_t KWS_COOLDOWN_MS = 2000;     // a model fires on several consecutive windows of one utterance
+const uint32_t KWS_RING_SAMPLES = 4096;    // 256 ms between the mic and the wake task; a power of two
+const uint16_t FLAG_PREROLL = 16;          // card only: pre-roll nobody asked to keep; recovery deletes it, the phone never sees it
+
+#if HAS_WAKE_WORD  // types here, above the prototypes Arduino generates for the wake task's functions
+enum Phrase { PERTHRO, MARK, FORGET };
+
+struct WakeModel {
+  const unsigned char *flatbuffer;
+  float cutoff;
+  tflite::MicroInterpreter *interpreter;
+  int stride, filled;
+  uint8_t recent[5];  // sliding window of probabilities
+  uint32_t quietUntilMs;
+};
+#endif
 
 // Energy VAD (per 505-sample block, after DC removal). First guesses: calibrate on the bench.
 const uint32_t VAD_MIN_ENERGY = 60 * 60;  // mean square; below this is silence whatever the floor says
@@ -63,11 +98,17 @@ bool cardReady;  // card mounted and /TK readable at boot; sdError on its own me
 std::atomic<bool> muted{false}, timeSynced{false}, storageFull{false}, sdError{false};
 std::atomic<bool> headerDirty{false}, bleConnected{false}, linkTrusted{false};
 std::atomic<int64_t> epochOffsetMs{0};
-std::atomic<uint32_t> droppedSamples{0}, chunksWritten{0}, pendingChunks{0}, worstWriteUs{0}, ledOffAtMs{0};
+std::atomic<uint32_t> droppedSamples{0}, chunksWritten{0}, pendingChunks{0}, worstWriteUs{0};
+// wakeWordOn: recording waits for "Perthro". active: the wearer wants audio kept (always, with the wake word off).
+std::atomic<bool> wakeWordOn{false}, active{true}, forgetRequested{false};
+bool wakeReady;  // the models loaded, so the wake word can be turned on
+std::atomic<uint32_t> cueStartMs{0}, cuePattern{0};  // LED pattern: pulses << 16 | pulse ms
 
 // Single-producer (mic) single-consumer (writer) ring. Counters run free; the index is counter % size.
 int16_t ring[RING_SAMPLES];
 std::atomic<uint32_t> ringHead{0}, ringTail{0};
+int16_t kwsRing[KWS_RING_SAMPLES];  // the same audio for the wake task; dropped there, never here, when it falls behind
+std::atomic<uint32_t> kwsHead{0}, kwsTail{0}, kwsDropped{0};
 portMUX_TYPE headMux = portMUX_INITIALIZER_UNLOCKED;
 int64_t headUs = 0;  // esp_timer time when the newest ring sample arrived; guarded by headMux with ringHead
 
@@ -79,7 +120,7 @@ struct Event {
   uint8_t len;
   uint8_t data[18];
 };
-QueueHandle_t requests, events, bookmarks;
+QueueHandle_t requests, events, bookmarks, forgets;
 TaskHandle_t bleTaskHandle;
 BLECharacteristic *tx;
 std::atomic<uint16_t> connHandle{0};
@@ -94,7 +135,21 @@ void openPairingWindow() {
   pairingOpenedMs = millis();
   pairingOpen = true;
 }
-bool isRecording() { return !muted && !storageFull && !sdError; }
+bool isRecording() { return !muted && active && !storageFull && !sdError; }
+
+// LED feedback for the wearer: recording on = 1 long, off = 2 short, bookmark = 1 short, forget = 3 (say it again) or 5 (done).
+void cue(uint16_t pulses, uint16_t ms) {
+  cuePattern = (uint32_t)pulses << 16 | ms;
+  cueStartMs = millis() | 1;
+}
+
+// Turning the wake word on stops keeping audio until "Perthro"; off records all the time, as without one.
+void setWakeWord(bool on) {
+  wakeWordOn = on;
+  active = !on;
+  prefs.putBool("wake_word", on);
+  Serial.println(on ? "wake word on: waiting for Perthro" : "wake word off: recording");
+}
 
 void chunkPath(char *out, char cls, uint32_t seq) {
   snprintf(out, 20, "/TK/%c%07lX.%s", cls, (unsigned long)seq, cls == 'P' ? "PRT" : "WAV");
@@ -146,12 +201,11 @@ void queueEvent(const uint8_t *data, uint8_t len) {
   xQueueSend(events, &e, 0);
 }
 
-// The one bookmark entry point: the serial 'b' command calls it today, the wake-word detector will later.
+// The one bookmark entry point, for the serial 'b' command and "Perthro mark".
 // Safe from any task; the writer attaches it to the chunk that holds this moment.
 void bookmark() {
   uint64_t t = uptimeMs();
-  digitalWrite(LED_BUILTIN, LOW);  // active LOW
-  ledOffAtMs = millis() + 300;
+  cue(1, 300);
   if (xQueueSend(bookmarks, &t, 0) != pdTRUE) Serial.println("bookmark dropped: queue full");
 }
 
@@ -184,6 +238,13 @@ void micTask(void *) {
     droppedSamples += got - n;  // never block on the writer: it may be stuck in a slow SD write
     if (!n) continue;
     for (size_t i = 0; i < n; i++) ring[(head + i) & (RING_SAMPLES - 1)] = buf[i];
+    if (wakeWordOn) {
+      uint32_t kh = kwsHead;
+      if (KWS_RING_SAMPLES - (kh - kwsTail) >= n) {
+        for (size_t i = 0; i < n; i++) kwsRing[(kh + i) & (KWS_RING_SAMPLES - 1)] = buf[i];
+        kwsHead = kh + n;
+      } else kwsDropped += n;
+    }
     portENTER_CRITICAL(&headMux);
     ringHead = head + n;
     headUs = esp_timer_get_time();
@@ -204,6 +265,20 @@ struct Recording {
   uint32_t lastFlushMs;
   uint8_t batch[BATCH_BLOCKS * BLOCK_BYTES];
 } rec;
+
+// While waiting for "Perthro": the full 30 s pre-roll file before the open one, finalized but still flagged.
+struct Preroll {
+  bool valid;
+  ChunkHeader hdr;
+  uint32_t audioCrc;  // the crc is redone when the flag is cleared, and the audio is not read back
+} prev;
+
+// Chunks kept this boot, for "Perthro forget": seq and uptime at their last sample. Writer only.
+struct Kept {
+  uint32_t seq;
+  uint64_t endUptimeMs;
+} kept[8];
+uint8_t keptNext;
 
 int32_t dcQ8;  // DC estimate in Q8
 bool dcSeeded;
@@ -259,6 +334,7 @@ bool openChunk(int64_t firstSampleUs, bool continuous) {
   rec.hdr.seq = nextSeq++;
   rec.hdr.bootId = bootId;
   rec.hdr.startUptimeMs = (uint64_t)firstSampleUs / 1000;
+  if (wakeWordOn && !active) rec.hdr.flags = FLAG_PREROLL;
   prefs.putUInt("next_seq", nextSeq);
   char path[20];
   chunkPath(path, 'P', rec.hdr.seq);
@@ -275,22 +351,101 @@ bool openChunk(int64_t firstSampleUs, bool continuous) {
   return true;
 }
 
+// Renames a finalized .PRT to its .WAV name, the commit point (1.6 rule 4), and tells the phone.
+bool publish(const ChunkHeader &h) {
+  char from[20], to[20];
+  char cls = classOf(h.flags);
+  chunkPath(from, 'P', h.seq);
+  chunkPath(to, cls, h.seq);
+  if (!card.rename(from, to)) return false;
+  chunksWritten++;
+  pendingChunks++;
+  kept[keptNext++ % 8] = {h.seq, h.startUptimeMs + (uint64_t)h.blocks * BLOCK_SAMPLES * 1000 / SAMPLE_RATE};
+  uint8_t e[11] = {FRAME_EVENT, EVENT_CHUNK_READY};
+  put32(e + 2, h.seq);
+  put32(e + 6, HEADER_BYTES + h.blocks * BLOCK_BYTES);
+  e[10] = listFlags(cls);
+  queueEvent(e, sizeof(e));
+  return true;
+}
+
+void removeOpenChunk() {
+  char path[20];
+  chunkPath(path, 'P', rec.hdr.seq);
+  rec.file.close();
+  rec.open = false;
+  card.remove(path);
+}
+
 void finalizeChunk() {
+  if (!rec.blocks) return removeOpenChunk();  // a chunk holds at least one block (1.2)
   if (!writeBatch() || !writeHeader(rec.blocks)) return failRecording("finalize");
   rec.file.close();
   rec.open = false;
-  char from[20], to[20];
-  char cls = classOf(rec.hdr.flags);
-  chunkPath(from, 'P', rec.hdr.seq);
-  chunkPath(to, cls, rec.hdr.seq);
-  if (!card.rename(from, to)) return failRecording("rename");  // the rename is the commit point (1.6 rule 4)
-  chunksWritten++;
-  pendingChunks++;
-  uint8_t e[11] = {FRAME_EVENT, EVENT_CHUNK_READY};
-  put32(e + 2, rec.hdr.seq);
-  put32(e + 6, HEADER_BYTES + rec.blocks * BLOCK_BYTES);
-  e[10] = listFlags(cls);
-  queueEvent(e, sizeof(e));
+  if (!publish(rec.hdr)) failRecording("rename");
+}
+
+void dropPrevPreroll() {
+  if (!prev.valid) return;
+  prev.valid = false;
+  char path[20];
+  chunkPath(path, 'P', prev.hdr.seq);
+  card.remove(path);
+}
+
+// The open pre-roll file holds 30 s: it becomes the previous one, and the one before that is dropped.
+void rotatePreroll() {
+  dropPrevPreroll();
+  if (!writeBatch() || !writeHeader(rec.blocks)) return failRecording("preroll");
+  rec.file.close();
+  rec.open = false;
+  prev = {true, rec.hdr, rec.crc};
+}
+
+// "Perthro": the pre-roll is kept. The previous file becomes a normal chunk; the open one continues as one.
+void keepPreroll() {
+  if (prev.valid) {
+    prev.valid = false;
+    ChunkHeader &h = prev.hdr;
+    h.flags &= ~FLAG_PREROLL;
+    if (timeSynced) {
+      h.flags |= FLAG_TIME_SYNCED;
+      h.epochOffsetMs = epochOffsetMs;
+    }
+    h.crc = 0;
+    uint8_t buf[HEADER_BYTES];
+    buildHeader(buf, h);
+    put32(buf + 92, h.crc = esp_rom_crc32_le(prev.audioCrc, buf, HEADER_BYTES));
+    char path[20];
+    chunkPath(path, 'P', h.seq);
+    File f = card.open(path, "r+");
+    bool ok = f && f.write(buf, HEADER_BYTES) == HEADER_BYTES;
+    f.close();
+    if (!ok || !publish(h)) Serial.printf("pre-roll %lu not kept: SD error\n", (unsigned long)h.seq);
+  }
+  if (rec.open && rec.hdr.flags & FLAG_PREROLL) {
+    rec.hdr.flags &= ~FLAG_PREROLL;
+    headerDirty = true;
+  }
+}
+
+void discardPreroll() {
+  if (rec.open && rec.hdr.flags & FLAG_PREROLL) removeOpenChunk();
+  dropPrevPreroll();
+}
+
+// "Perthro forget" twice: the open chunk, the pre-roll and every chunk kept in the last 5 minutes go.
+// Chunks still on the card are deleted by the BLE task between requests, so never mid-PULL.
+void forgetRecent() {
+  if (rec.open) removeOpenChunk();
+  dropPrevPreroll();
+  xQueueReset(bookmarks);
+  uint64_t now = uptimeMs(), from = now > FORGET_MS ? now - FORGET_MS : 0;
+  for (Kept &k : kept) {
+    if (k.seq && k.endUptimeMs > from) xQueueSend(forgets, &k.seq, 0);
+    k.seq = 0;
+  }
+  Serial.println("forgot the last 5 minutes");
 }
 
 void addBookmark(uint64_t t) {
@@ -340,6 +495,16 @@ void writerTask(void *) {
   uint32_t lastOpenTryMs = 0;
   bool continuous = false;
   for (;;) {
+    if (forgetRequested.exchange(false)) {
+      forgetRecent();
+      continuous = false;
+    }
+    if (!wakeWordOn) discardPreroll();  // turned off from the app: keep recording, but not the pre-roll
+    else if (active) keepPreroll();
+    else if (rec.open && !(rec.hdr.flags & FLAG_PREROLL)) {  // "Perthro" again: stop keeping audio
+      finalizeChunk();
+      continuous = !sdError;
+    }
     if (rec.open && headerDirty.exchange(false) && !writeHeader(0)) failRecording("header");
     if (rec.open && millis() - rec.lastFlushMs >= FLUSH_MS) {
       if (!writeBatch()) failRecording("write");
@@ -358,6 +523,7 @@ void writerTask(void *) {
     portEXIT_CRITICAL(&headMux);
     if (head - tail < BLOCK_SAMPLES) {
       if (muted) {  // the mic has stopped and the ring is drained: close the chunk, drop the partial block
+        discardPreroll();
         if (rec.open) finalizeChunk();
         continuous = false;
         ringTail = head;
@@ -393,8 +559,9 @@ void writerTask(void *) {
       failRecording("write");
       continue;
     }
-    if (rec.blocks == CHUNK_BLOCKS) {
-      finalizeChunk();
+    bool preroll = rec.hdr.flags & FLAG_PREROLL;
+    if (rec.blocks == (preroll ? PREROLL_BLOCKS : CHUNK_BLOCKS)) {
+      preroll ? rotatePreroll() : finalizeChunk();
       continuous = !sdError;
     }
   }
@@ -417,6 +584,12 @@ void recoverPartial(uint32_t seq) {
   if (len < HEADER_BYTES || f.read(h, HEADER_BYTES) != HEADER_BYTES || !parseHeader(h, c) || c.seq != seq || !blocks) {
     f.close();
     Serial.printf("recovery: %s is invalid or empty, deleting\n", path);
+    card.remove(path);
+    return;
+  }
+  if (c.flags & FLAG_PREROLL) {  // nobody said "Perthro" for it
+    f.close();
+    Serial.printf("recovery: %s is unkept pre-roll, deleting\n", path);
     card.remove(path);
     return;
   }
@@ -464,9 +637,9 @@ void startStorage() {
     return;
   }
   card.mkdir("/TK");
-  uint32_t partial[4], partialCount = 0;  // collect first: renaming while iterating the directory is unsafe
+  uint32_t partial[8], partialCount = 0;  // collect first: renaming while iterating the directory is unsafe
   forEachChunk([&](char cls, uint32_t seq, uint32_t) {
-    if (cls == 'P' && partialCount < 4) partial[partialCount++] = seq;
+    if (cls == 'P' && partialCount < 8) partial[partialCount++] = seq;
   });
   for (uint32_t i = 0; i < partialCount; i++) recoverPartial(partial[i]);
 
@@ -625,7 +798,7 @@ void handleStatus(uint8_t id) {
   uint8_t *s = frame + 4;
   memset(s, 0, 32);
   put16(s, 1);
-  s[2] = (uint8_t)(isRecording() | muted << 1 | timeSynced << 3 | storageFull << 4 | sdError << 5 | pairingWindowOpen() << 6);
+  s[2] = (uint8_t)(isRecording() | muted << 1 | wakeWordOn << 2 | timeSynced << 3 | storageFull << 4 | sdError << 5 | pairingWindowOpen() << 6);
   s[3] = 0xFF;  // battery unknown until the D0 ADC is wired
   put32(s + 4, storeId);
   put32(s + 8, bootId);
@@ -767,17 +940,157 @@ void handleRequest(const Request &r) {
       prefs.putBool("muted", p[0]);
       Serial.println(p[0] ? "muted" : "unmuted");
       return respond(op, id, ST_OK);
-    case OP_SET_WAKE_WORD: return respond(op, id, ERR_UNSUPPORTED);  // no detector yet
+    case OP_SET_WAKE_WORD:
+      if (!wakeReady) return respond(op, id, ERR_UNSUPPORTED);
+      if (p[0] > 1) return respond(op, id, ERR_BAD_VALUE);
+      setWakeWord(p[0]);
+      return respond(op, id, ST_OK);
   }
+}
+
+// Deletes a chunk "Perthro forget" covered, if it is still on the card.
+void forgetChunk(uint32_t seq) {
+  char path[20];
+  File f = openFinalized(seq, path);
+  if (!f) return;
+  f.close();
+  if (card.remove(path) && pendingChunks) pendingChunks--;
 }
 
 void bleTask(void *) {
   Request r;
+  uint32_t seq;
   for (;;) {
+    while (xQueueReceive(forgets, &seq, 0) == pdTRUE) forgetChunk(seq);
     sendEvents();
     if (xQueueReceive(requests, &r, pdMS_TO_TICKS(50)) == pdTRUE) handleRequest(r);
   }
 }
+
+// ---------------------------------------------------------------- wake task (microWakeWord, as benchmarked in kws_bench)
+
+#if HAS_WAKE_WORD
+const size_t STEP_SAMPLES = 160;  // 10 ms feature step, as the models were trained
+const int FEATURE_COUNT = 40;
+const size_t ARENA_BYTES = 32768;
+
+WakeModel wakeModels[] = {
+  {perthro_tflite, perthro_cutoff},
+  {perthro_mark_tflite, perthro_mark_cutoff},
+  {perthro_forget_tflite, perthro_forget_cutoff},
+};
+
+FrontendState frontend;
+tflite::MicroMutableOpResolver<20> resolver;
+uint32_t toggleAtMs, otherAtMs, forgetArmedMs;  // wake task only
+
+bool startWake() {
+  resolver.AddCallOnce(); resolver.AddVarHandle(); resolver.AddReadVariable(); resolver.AddAssignVariable();
+  resolver.AddReshape(); resolver.AddStridedSlice(); resolver.AddConcatenation(); resolver.AddConv2D();
+  resolver.AddDepthwiseConv2D(); resolver.AddMul(); resolver.AddAdd(); resolver.AddMean();
+  resolver.AddFullyConnected(); resolver.AddLogistic(); resolver.AddQuantize(); resolver.AddAveragePool2D();
+  resolver.AddMaxPool2D(); resolver.AddPad(); resolver.AddPack(); resolver.AddSplitV();
+  FrontendConfig c;  // must match microWakeWord's training features
+  FrontendFillConfigWithDefaults(&c);
+  c.window.size_ms = 30;
+  c.window.step_size_ms = 10;
+  c.filterbank.num_channels = FEATURE_COUNT;
+  c.filterbank.lower_band_limit = 125.0;
+  c.filterbank.upper_band_limit = 7500.0;
+  c.noise_reduction.smoothing_bits = 10;
+  c.noise_reduction.even_smoothing = 0.025;
+  c.noise_reduction.odd_smoothing = 0.06;
+  c.noise_reduction.min_signal_remaining = 0.05;
+  c.pcan_gain_control.enable_pcan = 1;
+  c.pcan_gain_control.strength = 0.95;
+  c.pcan_gain_control.offset = 80.0;
+  c.pcan_gain_control.gain_bits = 21;
+  c.log_scale.enable_log = 1;
+  c.log_scale.scale_shift = 6;
+  if (!FrontendPopulateState(&c, &frontend, SAMPLE_RATE)) return false;
+  for (WakeModel &m : wakeModels) {
+    uint8_t *arena = (uint8_t *)malloc(ARENA_BYTES);
+    if (!arena) return false;
+    auto *allocator = tflite::MicroAllocator::Create(arena, ARENA_BYTES);
+    auto *vars = tflite::MicroResourceVariables::Create(allocator, 20);
+    m.interpreter = new tflite::MicroInterpreter(tflite::GetModel(m.flatbuffer), resolver, allocator, vars);
+    if (m.interpreter->AllocateTensors() != kTfLiteOk) return false;
+    m.stride = m.interpreter->input(0)->dims->data[1];
+    Serial.printf("wake model %d: arena %u of %u B\n", (int)(&m - wakeModels), m.interpreter->arena_used_bytes(), ARENA_BYTES);
+  }
+  return true;
+}
+
+bool detect(WakeModel &m, const int8_t *features) {
+  memcpy(m.interpreter->input(0)->data.int8 + m.filled * FEATURE_COUNT, features, FEATURE_COUNT);
+  if (++m.filled < m.stride) return false;
+  m.filled = 0;
+  m.interpreter->Invoke();
+  memmove(m.recent, m.recent + 1, sizeof m.recent - 1);
+  m.recent[sizeof m.recent - 1] = m.interpreter->output(0)->data.uint8[0];
+  uint32_t sum = 0;
+  for (uint8_t p : m.recent) sum += p;
+  if ((int32_t)(millis() - m.quietUntilMs) < 0 || sum / sizeof m.recent <= m.cutoff * 255) return false;
+  memset(m.recent, 0, sizeof m.recent);
+  m.quietUntilMs = millis() + KWS_COOLDOWN_MS;
+  return true;
+}
+
+void setActive(bool on) {
+  if (!wakeWordOn) return;  // turned off from the app while a toggle was pending
+  active = on;
+  cue(on ? 1 : 2, on ? 600 : 200);
+  Serial.println(on ? "Perthro: recording" : "Perthro: stopped, waiting");
+}
+
+void onPhrase(Phrase p) {
+  uint32_t now = millis();
+  if (p == PERTHRO) {
+    if (now - otherAtMs > TOGGLE_DELAY_MS) toggleAtMs = (now + TOGGLE_DELAY_MS) | 1;
+    return;
+  }
+  toggleAtMs = 0;  // it was "Perthro mark" or "Perthro forget"
+  otherAtMs = now;
+  if (p == MARK) {
+    if (!active) setActive(true);  // the pre-roll holds the moment being marked
+    bookmark();
+  } else if (forgetArmedMs && now - forgetArmedMs < FORGET_CONFIRM_MS) {
+    forgetArmedMs = 0;
+    forgetRequested = true;
+    cue(5, 100);
+  } else {
+    forgetArmedMs = now | 1;
+    cue(3, 100);  // say it again to confirm
+  }
+}
+
+void wakeTask(void *) {
+  static int16_t samples[STEP_SAMPLES];
+  static int8_t features[FEATURE_COUNT];
+  for (;;) {
+    if (toggleAtMs && (int32_t)(millis() - toggleAtMs) >= 0) {
+      toggleAtMs = 0;
+      setActive(!active);
+    }
+    uint32_t tail = kwsTail;
+    if (kwsHead - tail < STEP_SAMPLES) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    for (size_t i = 0; i < STEP_SAMPLES; i++) samples[i] = kwsRing[(tail + i) & (KWS_RING_SAMPLES - 1)];
+    kwsTail = tail + STEP_SAMPLES;
+    size_t used;
+    FrontendOutput out = FrontendProcessSamples(&frontend, samples, STEP_SAMPLES, &used);
+    if (!out.size) continue;
+    for (int i = 0; i < FEATURE_COUNT; i++) {  // same scaling microWakeWord was trained with: ~0..670 -> int8
+      int32_t v = ((int32_t)out.values[i] * 256 + 333) / 666 - 128;
+      features[i] = (int8_t)constrain(v, -128, 127);
+    }
+    for (int i = 0; i < 3; i++)
+      if (detect(wakeModels[i], features)) onPhrase((Phrase)i);
+  }
+}
+#endif
 
 // ---------------------------------------------------------------- setup / loop
 
@@ -794,16 +1107,27 @@ void setup() {
   requests = xQueueCreate(2, sizeof(Request));
   events = xQueueCreate(8, sizeof(Event));
   bookmarks = xQueueCreate(4, sizeof(uint64_t));
+  forgets = xQueueCreate(8, sizeof(uint32_t));
 
   startBle();
   if (!prefs.isKey("store_id")) prefs.putUInt("store_id", esp_random());  // after BLE init: the radio seeds the RNG
   storeId = prefs.getUInt("store_id");
   startStorage();
-  Serial.printf("pendant up: store %08lX boot %lu%s\n", (unsigned long)storeId, (unsigned long)bootId, muted ? " (muted)" : "");
+#if HAS_WAKE_WORD
+  wakeReady = startWake();
+  if (!wakeReady) Serial.println("wake word: models did not load, recording all the time");
+#endif
+  wakeWordOn = wakeReady && prefs.getBool("wake_word", true);
+  active = !wakeWordOn;  // with the wake word, nothing is kept after boot until "Perthro"
+  Serial.printf("pendant up: store %08lX boot %lu%s%s\n", (unsigned long)storeId, (unsigned long)bootId,
+                muted ? " (muted)" : "", wakeWordOn ? " (waiting for Perthro)" : "");
 
   xTaskCreate(micTask, "mic", 4096, nullptr, configMAX_PRIORITIES - 3, nullptr);
   xTaskCreate(writerTask, "writer", 6144, nullptr, 4, nullptr);
   xTaskCreate(bleTask, "ble", 6144, nullptr, 3, &bleTaskHandle);
+#if HAS_WAKE_WORD
+  if (wakeReady) xTaskCreate(wakeTask, "wake", 8192, nullptr, 2, nullptr);
+#endif
 }
 
 void loop() {
@@ -822,8 +1146,13 @@ void loop() {
     openPairingWindow();
     Serial.println("BLE: bonds cleared, pairing window open");
   }
-  if (ledOffAtMs && (int32_t)(millis() - ledOffAtMs) >= 0) ledOffAtMs = 0;
-  digitalWrite(LED_BUILTIN, pairingWindowOpen() || ledOffAtMs ? LOW : HIGH);  // active LOW: on while pairing
+  bool cueOn = false;
+  if (uint32_t start = cueStartMs) {
+    uint32_t pattern = cuePattern, ms = pattern & 0xFFFF, elapsed = millis() - start;
+    if (elapsed >= (pattern >> 16) * 2 * ms) cueStartMs = 0;
+    else cueOn = elapsed % (2 * ms) < ms;
+  }
+  digitalWrite(LED_BUILTIN, pairingWindowOpen() != cueOn ? LOW : HIGH);  // active LOW: on while pairing; a cue blinks it
   if (bleConnected && !linkTrusted && millis() - connectedAtMs > (pairingWindowOpen() ? PAIRING_LINK_MS : UNTRUSTED_LINK_MS)) {
     Serial.println("BLE: link never bonded, disconnecting");
     ble_gap_terminate(connHandle, BLE_ERR_REM_USER_CONN_TERM);
@@ -831,8 +1160,9 @@ void loop() {
   }
   if (millis() - lastStatusMs >= 10000) {
     lastStatusMs = millis();
-    Serial.printf("[status] rec=%d chunks=%lu pending=%lu dropped=%lu worst_sd_us=%lu ble=%d%s%s\n", isRecording(),
-                  (unsigned long)chunksWritten, (unsigned long)pendingChunks, (unsigned long)droppedSamples,
+    Serial.printf("[status] rec=%d wake=%d chunks=%lu pending=%lu dropped=%lu kws_dropped=%lu worst_sd_us=%lu ble=%d%s%s\n",
+                  isRecording(), (int)wakeWordOn, (unsigned long)chunksWritten, (unsigned long)pendingChunks,
+                  (unsigned long)droppedSamples, (unsigned long)kwsDropped,
                   (unsigned long)worstWriteUs.exchange(0), (int)bleConnected, storageFull ? " FULL" : "", sdError ? " SD_ERROR" : "");
   }
   delay(10);

@@ -44,3 +44,11 @@ python -m microwakeword.model_train_eval --training_config training/wakeword/$P.
 
 Result: `$W/model/tflite_stream_state_internal_quant/stream_state_internal_quant.tflite`, with recall and false accepts per hour
 in the logs.
+
+## Into the firmware
+
+```sh
+python training/wakeword/export_models.py   # writes firmware/pendant/wake_models.h; tune --<phrase>_cutoff from the test results
+```
+
+The pendant builds with the wake word only when `firmware/pendant/wake_models.h` exists.

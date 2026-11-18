@@ -29,6 +29,11 @@ The firmware removes DC (the INMP441 offset drifts after power-up) before VAD an
 - A chunk ends early, with at least 1 block, when the user mutes, the storage is full, the device shuts down, or the power fails (see 1.6).
   A chunk always holds whole blocks.
 - While muted the mic is stopped and nothing is recorded.
+- With the wake word on, nothing is kept after boot until the wearer says "Perthro", and saying it again stops keeping audio.
+  While waiting, the device writes pre-roll files of 30 s each and keeps only the last two (`FLAG_PREROLL`, below).
+  "Perthro" turns them into normal chunks, so a recording starts 30 to 60 s before the word. Unkept pre-roll is deleted,
+  which leaves gaps in `seq`. "Perthro mark" while waiting also starts recording, then bookmarks.
+  "Perthro forget" said twice within 10 s deletes the chunk being recorded and every chunk kept in the last 5 minutes that is still on the card.
 
 ### 1.3 Files
 
@@ -40,7 +45,8 @@ The firmware removes DC (the INMP441 offset drifts after power-up) before VAD an
 | `seq` | u32 counter, unique per `store_id`, starts at 1, +1 per chunk, never reused; max `0x0FFFFFFF` (7 hex digits, about 510 years) |
 
 The class prefix lets the device sort the sync order from directory names alone, without opening files.
-At most one `.PRT` file exists while the device runs, plus one left behind by each SD write error (see 1.6 rule 6).
+At most three `.PRT` files exist while the device runs (the open chunk and, while waiting for the wake word, the previous pre-roll),
+plus one left behind by each SD write error (see 1.6 rule 6).
 
 **Not encrypted:** chunks are stored as plain WAV files. Anyone holding the pendant can remove the card and play
 every chunk that has not been synced and acked. Encryption at rest is deferred.
@@ -77,7 +83,7 @@ The header is always exactly 512 bytes, so the audio starts on an SD sector boun
 | 52 | 4c | `tkmd` | Thoughtaker metadata chunk |
 | 56 | u32 | tkmd size | 444 |
 | 60 | u16 | tkmd version | 1 |
-| 62 | u16 | flags | bit0 `has_speech`, bit1 `bookmarked`, bit2 `time_synced`, bit3 `recovered`; other bits 0 |
+| 62 | u16 | flags | bit0 `has_speech`, bit1 `bookmarked`, bit2 `time_synced`, bit3 `recovered`, bit4 `preroll` (on the card only: never set in a `.WAV`); other bits 0 |
 | 64 | u32 | store_id | |
 | 68 | u32 | seq | must match the file name |
 | 72 | u32 | boot_id | boot in which the chunk was recorded |
@@ -139,6 +145,7 @@ Recovery, at boot before recording starts, for each `*.PRT`:
 |---|---|
 | length < 512, or bytes 0..3 are not `RIFF`, or bytes 52..55 are not `tkmd`, or the tkmd `seq` does not match the name | delete |
 | `blocks = floor((length - 512) / 256)` is 0 | delete |
+| `preroll` is set (pre-roll nobody said "Perthro" for) | delete |
 | otherwise | set the sizes and `fact` from `blocks`, set `recovered`, drop any `bookmark_ms` at or beyond the duration, compute the crc by reading the file back, write the header, close, and rename to `.WAV` |
 
 Recovery is idempotent: a power loss during recovery leaves the `.PRT` in place, and recovery runs again on the next boot.
@@ -233,7 +240,7 @@ Every request gets exactly one RESP. A payload follows only when `status = 0`.
 | 0x04 | PULL | `seq u32`, `offset u32`, `length u32` | none | DATA frames cover `[offset, offset+length)` in order, and **the RESP comes after the last DATA frame**. 1 <= length <= 65536, and offset+length <= the valid file length. |
 | 0x05 | ACK | `seq u32`, `crc32 u32` | none | The device deletes the chunk only if `crc32` equals the stored header crc. ACK of a seq that does not exist returns **OK** (idempotent: a retry after a lost RESP must not fail). |
 | 0x06 | SET_MUTE | `muted u8` (0/1) | none | Muting finalizes the current chunk and stops the mic. Kept in NVS across reboots. |
-| 0x07 | SET_WAKE_WORD | `enabled u8` (0/1) | none | Kept in NVS. ERR_UNSUPPORTED if no wake-word engine is built in. |
+| 0x07 | SET_WAKE_WORD | `enabled u8` (0/1) | none | Kept in NVS (default on). Turning it on stops keeping audio until "Perthro"; off records all the time. ERR_UNSUPPORTED if the firmware was built without wake-word models. |
 
 Status payload (32 B):
 
@@ -249,9 +256,10 @@ Status payload (32 B):
 | 24 | u32 | total_kib |
 | 28 | u32 | pending_chunks (finalized `.WAV` count) |
 
-`recording` = not muted, and not `storage_full`, and not `sd_error`.
+`recording` = audio is being kept: not muted, and (wake word off, or "Perthro" said), and not `storage_full`, and not `sd_error`.
+So the app shows "Waiting for Perthro" when `wake_word_enabled` is set and `recording` and `muted` are not.
 `sd_error` = no usable card at boot, or the last chunk open or write failed (the device retries every 5 s, see 1.6 rule 6).
-This firmware has no wake-word engine: SET_WAKE_WORD always returns ERR_UNSUPPORTED and `wake_word_enabled` is 0.
+Firmware built without `wake_models.h` has no wake-word engine: SET_WAKE_WORD returns ERR_UNSUPPORTED and `wake_word_enabled` is 0.
 
 LIST Entry (9 B): `seq u32`, `size u32` (valid file length), `flags u8` (bit0 `has_speech`, bit1 `bookmarked`, taken from the class prefix).
 
@@ -260,7 +268,7 @@ LIST Entry (9 B): `seq u32`, `size u32` (valid file length), `flags u8` (bit0 `h
 | Event | Name | Payload | When |
 |---|---|---|---|
 | 0x01 | CHUNK_READY | `seq u32`, `size u32`, `flags u8` (as in a LIST entry) | after the rename to `.WAV` |
-| 0x02 | BOOKMARK | `seq u32` (chunk being recorded), `offset_ms u32` (from the chunk start), `uptime_ms u64` | wake word detected |
+| 0x02 | BOOKMARK | `seq u32` (chunk being recorded), `offset_ms u32` (from the chunk start), `uptime_ms u64` | "Perthro mark" |
 
 ### 3.5 Sync procedure (phone)
 
